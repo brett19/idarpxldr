@@ -381,7 +381,7 @@ static void
 }
 
 static void
-    processRelocations(RplSection &section, std::vector<RplSection> &sections)
+    processRelocations(RplModule &module, RplSection &section, std::vector<RplSection> &sections)
 {
     // TODO: Support more than one symbol section (symsec)
     auto symsec = sections[section.header.sh_link];
@@ -390,10 +390,8 @@ static void
 
     // Find our relocation section addresses
     auto relsec = sections[section.header.sh_info];
-    auto baseAddress = relsec.header.sh_addr;
-    //auto virtAddress = relsec.section->address;
 
-    static int relocs_printed = 0;
+    msg("Fixup Bits: %d\n", ph.high_fixup_bits);
 
     for (auto i = 0u; i < count; ++i) {
         ElfRela rela;
@@ -402,45 +400,31 @@ static void
         auto index = rela.r_info >> 8;
         auto type = rela.r_info & 0xff;
 
-        if (relocs_printed++ < 200) {
-        msg("Relocation %08x -> %02x %06x %d\n", 
-            rela.r_offset, type, index, rela.r_addend);
+        if (index >= module.symbols.size()) {
+            loader_failure("Missing symbol");
         }
+        auto &symbol = module.symbols[index];
 
-        /*
-
-        auto symbol = module.symbols[index];
-        if (!symbol) {
-            xLog() << "weird";
-        }
-        auto base = symbol ? symbol->address : 0;
-        auto value = base + rela.r_addend;
-
-        auto addr = rela.r_offset - baseAddress + virtAddress;
-        auto ptr8 = gMemory.translate(addr);
-        auto ptr16 = reinterpret_cast<uint16_t*>(ptr8);
-        auto ptr32 = reinterpret_cast<uint32_t*>(ptr8);
+        uint32_t relocAddr = symbol.address + rela.r_addend;
 
         switch (type) {
         case R_PPC_ADDR32:
-            *ptr32 = byte_swap(value);
+            patch_long(rela.r_offset, relocAddr);
             break;
         case R_PPC_ADDR16_LO:
-            *ptr16 = byte_swap<uint16_t>(value & 0xffff);
+            patch_word(rela.r_offset, relocAddr & 0xFFFF);
             break;
         case R_PPC_ADDR16_HI:
-            *ptr16 = byte_swap<uint16_t>(value >> 16);
+            patch_word(rela.r_offset, relocAddr >> 16);
             break;
         case R_PPC_ADDR16_HA:
-            *ptr16 = byte_swap<uint16_t>((value + 0x8000) >> 16);
+            patch_word(rela.r_offset, (relocAddr + 0x8000) >> 16);
             break;
         case R_PPC_REL24:
-            *ptr32 = byte_swap((byte_swap(*ptr32) & ~0x03fffffc) | ((value - rela.r_offset) & 0x03fffffc));
+            auto oval = get_original_long(rela.r_offset);
+            patch_long(rela.r_offset, (oval & ~0x03fffffc) | ((relocAddr - rela.r_offset) & 0x03fffffc));
             break;
-        default:
-            xDebug() << "Unknown relocation type: " << type;
         }
-        */
     }
 }
 
@@ -578,14 +562,15 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
     
     create_filename_cmt();
 
-    imp_offset = uint32_t(imp_offset + 7 / 8) * 8;
+    imp_offset = (imp_offset + 0x7) & ~0x7;
 
-    if (!add_segm(1, imp_offset, imp_offset + imp_size, NAME_EXTERN, "XTRN")) {
+    if (!add_segm(0, imp_offset, imp_offset + imp_size, NAME_EXTERN, "XTRN")) {
         loader_failure();
     }
 
     segment_t *impseg = getseg(imp_offset);
     impseg->align = saRelQword;
+    impseg->perm = SEGPERM_READ | SEGPERM_EXEC;
     impseg->update();
 
     RplModule module;
@@ -602,17 +587,29 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
     }
 
     uint32_t extern_idx = 0;
-    for (auto symbol : module.symbols) {
+    for (auto &symbol : module.symbols) {
         if (symbol.type == STT_FUNC) {
             symbol.address = imp_offset + 8 * extern_idx++;
 
             std::string idaSymName = std::string(FUNC_IMPORT_PREFIX) + symbol.name;
             do_name_anyway(symbol.address, idaSymName.c_str(), 0);
 
-            doDwrd(symbol.address + 0, 4);
-            doDwrd(symbol.address + 4, 4);
+            do_data_ex(symbol.address+0, codeflag(), 4, BADNODE);
+            doDwrd(symbol.address+4, 4);
 
             set_offset(symbol.address, 0, 0);
+        } else if (symbol.type == STT_OBJECT) {
+            symbol.address = imp_offset + 8 * extern_idx++;
+
+            std::string idaSymName = std::string(FUNC_IMPORT_PREFIX) + symbol.name;
+            do_name_anyway(symbol.address, idaSymName.c_str(), 0);
+
+            doDwrd(symbol.address+0, 4);
+            doDwrd(symbol.address+4, 4);
+
+            set_offset(symbol.address, 0, 0);
+        } else {
+            symbol.address = 0xBAD0DADA;
         }
     }
 
@@ -624,10 +621,11 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
         }
 
         msg("Processing relocation in segment %d\n", i);
-        processRelocations(section, sections);
+        processRelocations(module, section, sections);
     }
 
     add_entry(header.e_entry, header.e_entry, "start", true);
+    
 }
 
 //--------------------------------------------------------------------------
