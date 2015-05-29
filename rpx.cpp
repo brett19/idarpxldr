@@ -213,6 +213,9 @@ struct RplSection
     //ModuleSymbol *msym = nullptr;
     ElfSectionHeader header;
     std::vector<char> data;
+
+    std::string libName;
+    netnode imports;
 };
 
 static void
@@ -327,56 +330,13 @@ static void
         symbol.index = i;
         symbol.name = name;
         symbol.type = type;
+        symbol.address = 0x00000000;
         module.symbols.push_back(symbol);
 
-        // Calculate relocated address
-        //auto &impsec = sections[header.st_shndx];
-        //auto offset = header.st_value - impsec.header.sh_addr;
-        //auto baseAddress = impsec.section ? impsec.section->address : 0;
-        //auto virtAddress = baseAddress + offset;
-
-        // Create symbol data
-        /*
-        SymbolInfo *symbol = nullptr;
-        auto name = strtab.data.data() + header.st_name;
-
-        if (type == STT_FUNC) {
-            auto fsym = new FunctionSymbol();
-            fsym->systemFunction = findSystemFunction(impsec.msym, name);
-            fsym->functionType = fsym->systemFunction ? FunctionSymbol::System : FunctionSymbol::User;
-            symbol = fsym;
-        } else if (type == STT_OBJECT) {
-            auto dsym = new DataSymbol();
-            dsym->systemData = findSystemData(impsec.msym, name);
-            dsym->dataType = dsym->systemData ? DataSymbol::System : DataSymbol::User;
-            symbol = dsym;
-        } else if (type == STT_SECTION) {
-            auto msym = new ModuleSymbol();
-            msym->systemModule = findSystemModule(name);
-            msym->moduleType = msym->systemModule ? ModuleSymbol::System : ModuleSymbol::User;
-            impsec.msym = msym;
-            symbol = msym;
-        } else {
-            symbol = new SymbolInfo();
-            symbol->type = SymbolInfo::Invalid;
+        auto &section = sections[header.st_shndx];
+        if (!section.libName.empty()) {
+            section.imports.supset(header.st_value, name);
         }
-
-        assert(symbol);
-        symbol->index = i;
-        symbol->name = name;
-        symbol->address = virtAddress;
-        module.symbols[i] = symbol;
-        xLog() << Log::hex(symbol->address) << " " << symbol->name << " " << symbol->type;
-
-        // Write thunks
-        if (symbol->address) {
-            if (type == STT_FUNC) {
-                writeFunctionThunk(symbol->address, symbol->index);
-            } else if (type == STT_OBJECT) {
-                writeDataThunk(symbol->address, symbol->index);
-            }
-        }
-        */
     }
 }
 
@@ -405,6 +365,10 @@ static void
         }
         auto &symbol = module.symbols[index];
 
+        if (symbol.address == 0) {
+            //loader_failure("Found relocation of unexpected type.");
+        }
+
         uint32_t relocAddr = symbol.address + rela.r_addend;
 
         switch (type) {
@@ -426,6 +390,17 @@ static void
             break;
         }
     }
+}
+
+static RplSection*
+    findSection(std::vector<RplSection> &sections, uint32_t ea)
+{
+    for (auto &section : sections) {
+        if (ea >= section.header.sh_addr && ea < section.header.sh_addr + section.data.size()) {
+            return &section;
+        }
+    }
+    return nullptr;
 }
 
 //--------------------------------------------------------------------------
@@ -564,16 +539,38 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
 
     imp_offset = (imp_offset + 0x7) & ~0x7;
 
-    if (!add_segm(0, imp_offset, imp_offset + imp_size, NAME_EXTERN, "XTRN")) {
+    if (!add_segm(0, imp_offset, imp_offset + imp_size, "plt.imports", CLASS_CODE)) {
         loader_failure();
     }
 
     segment_t *impseg = getseg(imp_offset);
+    impseg->set_loader_segm(true);
     impseg->align = saRelQword;
     impseg->perm = SEGPERM_READ | SEGPERM_EXEC;
+    impseg->defsr[0] = 0x00000000;
+    impseg->defsr[1] = 0x00000000;
+    impseg->defsr[2] = 0x00000000;
+    impseg->defsr[3] = 0x00000000;
+    impseg->defsr[4] = 0x00000000;
+    impseg->defsr[5] = 0x00000000;
+    impseg->defsr[6] = 0x00000000;
     impseg->update();
 
     RplModule module;
+
+    for (auto i = 0u; i < sections.size(); ++i) {
+        auto &section = sections[i];
+
+        if (section.header.sh_type != SHT_RPL_IMPORTS) {
+            continue;
+        }
+
+        auto iinfo = (RplImportInfo*)section.data.data();
+        auto importName = (char*)iinfo->data;
+
+        section.libName = importName;
+        section.imports.create();
+    }
 
     for (auto i = 0u; i < sections.size(); ++i) {
         auto &section = sections[i];
@@ -586,6 +583,16 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
         processSymbols(module, section, sections);
     }
 
+    for (auto i = 0u; i < sections.size(); ++i) {
+        auto &section = sections[i];
+
+        if (section.header.sh_type != SHT_RPL_IMPORTS) {
+            continue;
+        }
+
+        import_module(section.libName.c_str(), NULL, section.imports, NULL, "wiiu");
+    }
+
     uint32_t extern_idx = 0;
     for (auto &symbol : module.symbols) {
         if (symbol.type == STT_FUNC) {
@@ -594,13 +601,13 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
             std::string idaSymName = std::string(FUNC_IMPORT_PREFIX) + symbol.name;
             do_name_anyway(symbol.address, idaSymName.c_str(), 0);
 
-            do_data_ex(symbol.address+0, codeflag(), 4, BADNODE);
-            doDwrd(symbol.address+4, 4);
+            auto_make_code(symbol.address+0);
+            auto_make_code(symbol.address+4);
 
             set_offset(symbol.address, 0, 0);
         } else if (symbol.type == STT_OBJECT) {
             symbol.address = imp_offset + 8 * extern_idx++;
-
+            
             std::string idaSymName = std::string(FUNC_IMPORT_PREFIX) + symbol.name;
             do_name_anyway(symbol.address, idaSymName.c_str(), 0);
 
@@ -608,8 +615,6 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
             doDwrd(symbol.address+4, 4);
 
             set_offset(symbol.address, 0, 0);
-        } else {
-            symbol.address = 0xBAD0DADA;
         }
     }
 

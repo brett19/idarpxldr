@@ -226,6 +226,13 @@ struct ElfRela
     int32_t r_addend;
 };
 
+struct RplImportInfo
+{
+    uint32_t rpl_num_imports;
+    uint32_t rpl_crc;
+    char data[0];
+};
+
 struct RplFileInfo
 {
     uint32_t rpl_min_version;
