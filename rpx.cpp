@@ -384,10 +384,13 @@ static void
         case R_PPC_ADDR16_HA:
             patch_word(rela.r_offset, (relocAddr + 0x8000) >> 16);
             break;
-        case R_PPC_REL24:
+        case R_PPC_REL24: {
             auto oval = get_original_long(rela.r_offset);
             patch_long(rela.r_offset, (oval & ~0x03fffffc) | ((relocAddr - rela.r_offset) & 0x03fffffc));
             break;
+        }
+        default:
+            loader_failure("Encountered unexpected relocation type.");
         }
     }
 }
@@ -408,9 +411,8 @@ void idaapi load_file(linput_t *li, ushort _neflag, const char * /*fileformatnam
 {
     BigEndianView in(li);
     
-    if (ph.id != PLFM_PPC) {
-        set_processor_type("ppc:PAIRED", SETPROC_ALL | SETPROC_FATAL);
-    }
+    // Force processor to PPC PAIRED.
+    set_processor_type("ppc:PAIRED", SETPROC_ALL | SETPROC_FATAL);
 
     ElfHeader header;
     if (!readHeader(in, header)) {
